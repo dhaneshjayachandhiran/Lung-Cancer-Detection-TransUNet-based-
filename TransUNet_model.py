@@ -9,17 +9,13 @@ from glob import glob
 from tqdm import tqdm
 
 # =============================================================================
-# 1. ULTIMATE CONFIGURATION (UPDATED PATH)
+# 1. ULTIMATE CONFIGURATION
 # =============================================================================
 class TransUNetConfig:
-    # Root directory on your local I: drive as per project structure
-    ROOT_DIR = r'I:\Lung Cancer Project (Simple CNN)'
+    ROOT_DIR = r'.'
     PREPROCESSED_PATH = os.path.join(ROOT_DIR, 'TransUNet_Preprocessed_Data')
-    
-    # Updated path to match your local file system for weight persistence
     MODEL_SAVE_PATH = os.path.join(ROOT_DIR, 'transunet_ULTIMATE_best.pth')
     
-    # Core conditions - DO NOT CHANGE
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     BATCH_SIZE = 10 
     EPOCHS = 50      
