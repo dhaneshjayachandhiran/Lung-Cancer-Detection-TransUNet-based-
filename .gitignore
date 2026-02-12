@@ -2,6 +2,5 @@ __pycache__/
 ResNet_Preprocessed_Data/
 SimpleCNN_Preprocessed_Data/
 Subsets/
-TransUNet_Preprocessed_Data/
 venv/
 .groupedtimelineinclude
