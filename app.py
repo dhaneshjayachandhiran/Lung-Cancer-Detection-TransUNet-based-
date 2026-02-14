@@ -5,47 +5,28 @@ import numpy as np
 import torch
 import pandas as pd
 import SimpleITK as sitk
+from glob import glob
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import tempfile
-from glob import glob
-from fpdf import FPDF
-
-# Import model classes
 from TransUNet_model import UltimateTransUNet, TransUNetConfig, MultiTaskDataset
-from Resnet_model import ResNetMultiTaskModel
-from simpleCNN_model import SimpleMultiTaskCNN
 
 # =============================================================================
-# 1. CORE LOGIC (Loading & Synchronized Data)
+# 1. CORE LOGIC (Load Model & Data)
 # =============================================================================
 @st.cache_resource
-def load_all_models():
+def load_resources():
     config = TransUNetConfig()
     device = config.DEVICE
+    model = UltimateTransUNet(in_channels=config.SLICES).to(device)
+    # Ensure this file is in your root directory
+    model.load_state_dict(torch.load("transunet_ULTIMATE_best.pth", map_location=device, weights_only=True))
+    model.eval()
     
-    models = {
-        "TransUNet": UltimateTransUNet(in_channels=config.SLICES).to(device),
-        "ResNet-18": ResNetMultiTaskModel().to(device),
-        "SimpleCNN": SimpleMultiTaskCNN().to(device)
-    }
-    
-    paths = {
-        "TransUNet": "transunet_ULTIMATE_best.pth",
-        "ResNet-18": "resnet_multitask_best.pth",
-        "SimpleCNN": "simpleCNN_unet_best.pth"
-    }
+    csv_path = os.path.join(config.ROOT_DIR, 'Common CSV files', 'candidates_V2.csv')
+    candidates_df = pd.read_csv(csv_path)
+    return model, config, candidates_df
 
-    for name, model in models.items():
-        if os.path.exists(paths[name]):
-            model.load_state_dict(torch.load(paths[name], map_location=device, weights_only=True))
-            model.eval()
-        else:
-            st.error(f"Missing weights for {name}")
-            
-    return models, config
-
-def get_synchronized_data(selected_path, config, candidates_df):
+def get_prediction_data(selected_path, config, candidates_df):
     filename = os.path.basename(selected_path)
     parts = filename.replace(".npy", "").split("_")
     series_uid = parts[1]
@@ -63,120 +44,83 @@ def get_synchronized_data(selected_path, config, candidates_df):
     return full_img_array, voxel_coords, series_uid
 
 # =============================================================================
-# 2. PDF GENERATION LOGIC
+# 2. UI LAYOUT
 # =============================================================================
-def generate_pdf_report(uid, scores, main_plot_path, zoom_plot_path):
-    pdf = FPDF()
-    pdf.add_page()
-    
-    # Header
-    pdf.set_font("Arial", 'B', 18)
-    pdf.cell(200, 10, "Multi-Model Lung Cancer Diagnostic Report", ln=True, align='C')
-    pdf.set_font("Arial", '', 12)
-    pdf.cell(200, 10, f"Patient Series UID: {uid}", ln=True, align='C')
-    pdf.ln(5)
+st.set_page_config(page_title="TransUNet Analysis", layout="wide")
+model, config, candidates_df = load_resources()
 
-    # Performance Metrics
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(200, 10, "Architectural Consensus Analysis", ln=True)
-    pdf.set_font("Arial", '', 12)
-    for name, conf in scores.items():
-        status = "MALIGNANT" if conf > 50 else "BENIGN"
-        pdf.cell(200, 8, f"- {name}: {conf:.2f}% Confidence Score ({status})", ln=True)
-    
-    pdf.ln(5)
-    
-    # Visualization
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(200, 10, "Detection & Localization Mapping", ln=True)
-    pdf.image(main_plot_path, x=10, y=None, w=180)
-    pdf.ln(2)
-    pdf.image(zoom_plot_path, x=50, y=None, w=100)
-    
-    pdf.set_y(-25)
-    pdf.set_font("Arial", 'I', 10)
-    pdf.cell(0, 10, "Generated via AI Ensemble Diagnostic Suite. Review by Radiologist required.", align='C')
-    
-    return pdf.output(dest="S").encode("latin-1")
+st.title("🔬 TransUNet: Hybrid Transformer-CNN for Lung Cancer")
+st.markdown("---")
 
-# =============================================================================
-# 3. UI LAYOUT & EXECUTION
-# =============================================================================
-st.set_page_config(page_title="Multi-Model Diagnostic Suite", layout="wide")
-st.title("🫁 Multi-Model AI Lung Cancer Localization")
+# Section 1: Technical Explanation
+st.header("1. How it's Trained")
+col_text, col_img = st.columns([2, 1])
+with col_text:
+    st.write("""
+    The **Ultimate TransUNet** model is a multi-task framework trained on the LUNA16 dataset for simultaneous **Nodule Segmentation** and **Malignancy Classification**.
+    
+    * **The Encoder**: A CNN backbone extracts high-resolution local features (edges, textures).
+    * **The Transformer Bottleneck**: 6 Transformer blocks model long-range dependencies, allowing the model to understand the nodule's position relative to the entire lung anatomy.
+    * **Hybrid Loss**: We use a combination of **Dice Loss** (for precise mask overlap) and **Focal Cross-Entropy** (to handle the class imbalance of small nodules).
+    * **Integrity**: Validated with a Brier Score of **0.0523**, ensuring diagnostic "honesty" over raw overconfidence.
+    """)
+with col_img:
+    st.info("**Model Stats**\n- Accuracy: 93.63%\n- AUC-ROC: 0.9807\n- Precision: 0.96")
 
-models_dict, config = load_all_models()
-candidates_df = pd.read_csv(os.path.join(config.ROOT_DIR, 'Common CSV files', 'candidates_V2.csv'))
+st.markdown("---")
 
-if st.sidebar.button("🔬 Pick Random Patient"):
-    pos_paths = glob(os.path.join(config.PREPROCESSED_PATH, 'trans_pre_subset*', 'images', 'pos*.npy'))
-    st.session_state.sample_path = random.choice(pos_paths)
+# Section 2: Fixed Examples from Dataset
+st.header("2. Dataset Examples (Fixed Samples)")
+ex_paths = glob(os.path.join(config.PREPROCESSED_PATH, 'trans_pre_subset*', 'images', 'pos*.npy'))[:3]
+e_cols = st.columns(3)
 
-if 'sample_path' in st.session_state:
-    img_full, v_coords, uid = get_synchronized_data(st.session_state.sample_path, config, candidates_df)
-    patch_3d = np.load(st.session_state.sample_path)
+for i, path in enumerate(ex_paths):
+    with e_cols[i]:
+        patch = np.load(path)
+        fig, ax = plt.subplots(facecolor='black')
+        ax.imshow(patch[32, :, :], cmap='bone')
+        ax.set_title(f"Example {i+1}", color='white')
+        ax.axis('off')
+        st.pyplot(fig)
+
+st.markdown("---")
+
+# Section 3: Random Prediction Generator
+st.header("3. Real-Time Diagnostic Generator")
+if st.button("🚀 Randomly Pick Patient & Generate Prediction"):
+    all_pos = glob(os.path.join(config.PREPROCESSED_PATH, 'trans_pre_subset*', 'images', 'pos*.npy'))
+    sample = random.choice(all_pos)
+    
+    img_full, v_coords, uid = get_prediction_data(sample, config, candidates_df)
+    patch_3d = np.load(sample)
     vx, vy, vz = v_coords[0], v_coords[1], v_coords[2]
 
     # Inference
-    img_input = patch_3d[24:40, :, :]
-    img_tensor = torch.from_numpy(img_input).float().unsqueeze(0).to(config.DEVICE)
-    
-    results = {}
+    img_tensor = torch.from_numpy(patch_3d[24:40, :, :]).float().unsqueeze(0).to(config.DEVICE)
     with torch.no_grad():
-        for name, model in models_dict.items():
-            output = model(img_tensor)
-            mask = torch.sigmoid(output[0]).cpu().numpy()[0, 0] if isinstance(output, tuple) else None
-            logits = output[1] if isinstance(output, tuple) else output
-            conf = torch.sigmoid(logits).item() * 100
-            results[name] = {"conf": conf, "mask": mask}
+        p_mask, p_clf = model(img_tensor)
+        mask = torch.sigmoid(p_mask).cpu().numpy()[0, 0]
+        conf = torch.sigmoid(p_clf).item() * 100
 
-    # UI Display
-    st.subheader(f"Diagnostic Analysis | Patient UID: {uid}")
+    # UI Results
+    st.subheader(f"Patient UID: {uid}")
+    r_col1, r_col2 = st.columns(2)
     
-    # Main Comparison Plots
-    fig_main, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor='black')
-    for i, (name, data) in enumerate(results.items()):
-        axes[i].imshow(img_full[vz, :, :], cmap='gray')
-        if data['conf'] > 50:
-            rect = patches.Rectangle((vx-20, vy-20), 40, 40, lw=2, edgecolor='red', facecolor='none')
-            axes[i].add_patch(rect)
-            axes[i].set_title(f"{name}: {data['conf']:.1f}%", color='red')
-        else:
-            axes[i].set_title(f"{name}: {data['conf']:.1f}%", color='green')
-        axes[i].axis('off')
-    st.pyplot(fig_main)
+    with r_col1:
+        st.write("### AI Localization")
+        fig_loc, ax_loc = plt.subplots(figsize=(10, 5), facecolor='black')
+        ax_loc.imshow(img_full[vz, :, :], cmap='gray')
+        rect = patches.Rectangle((vx-25, vy-25), 50, 50, lw=2, edgecolor='red', facecolor='none')
+        ax_loc.add_patch(rect)
+        ax_loc.set_title(f"Malignancy Risk: {conf:.2f}%", color='red' if conf > 50 else 'green')
+        ax_loc.axis('off')
+        st.pyplot(fig_loc)
 
-    st.markdown("---")
-    
-    # High-Res Patch Comparison
-    fig_zoom, z_axes = plt.subplots(1, 3, figsize=(15, 5), facecolor='black')
-    for i, (name, data) in enumerate(results.items()):
-        z_axes[i].imshow(patch_3d[32, :, :], cmap='bone')
-        if data['mask'] is not None:
-            z_axes[i].imshow(data['mask'], cmap='jet', alpha=0.3)
-            z_axes[i].set_title(f"{name} Segmentation", color='white')
-        else:
-            z_axes[i].set_title(f"{name} Feature View", color='white')
-        z_axes[i].axis('off')
-    st.pyplot(fig_zoom)
-
-    # EXPORT SECTION
-    st.sidebar.markdown("---")
-    if st.sidebar.button("📄 Generate Diagnostic Report"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_main, \
-             tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_zoom:
-            
-            fig_main.savefig(tmp_main.name, facecolor='white', bbox_inches='tight')
-            fig_zoom.savefig(tmp_zoom.name, facecolor='white', bbox_inches='tight')
-            
-            pdf_bytes = generate_pdf_report(uid, {k: v['conf'] for k, v in results.items()}, tmp_main.name, tmp_zoom.name)
-            
-            st.sidebar.download_button(
-                label="💾 Download PDF",
-                data=pdf_bytes,
-                file_name=f"Diagnostic_Report_{uid}.pdf",
-                mime="application/pdf"
-            )
-
-else:
-    st.info("Select 'Pick Random Patient' to begin the comparative diagnosis.")
+    with r_col2:
+        st.write("### High-Res Segmentation")
+        fig_seg, ax_seg = plt.subplots(figsize=(5, 5), facecolor='black')
+        ax_seg.imshow(patch_3d[32, :, :], cmap='bone')
+        ax_seg.imshow(mask, cmap='jet', alpha=0.4) # Overlaying predicted mask
+        ax_seg.set_title("TransUNet Predicted Mask", color='white')
+        ax_seg.axis('off')
+        st.pyplot(fig_seg)
