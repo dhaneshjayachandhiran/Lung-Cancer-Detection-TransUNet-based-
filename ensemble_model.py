@@ -107,41 +107,64 @@ def main():
     file_list = [(os.path.basename(f), 1 if "pos" in f else 0) for f in all_files]
     train_files, _ = train_test_split(file_list, test_size=0.2, random_state=42)
     
-    # Corrected variable name here
     train_dataset = EnsembleDataset(train_files, img_dir, msk_dir)
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
     model = UltimateEnsembleBrain(in_channels=16).to(device)
     
-    # Load V3 checkpoint with security fix
-    v3_path = "ultimate_ensemble_brain_v3.pth"
-    if os.path.exists(v3_path):
-        model.load_state_dict(torch.load(v3_path, map_location=device, weights_only=True))
-        print("✅ Resume from V3 (0.72 Dice) checkpoint...")
+    # Load V4 FINAL checkpoint to fine-tune the 0.7995 Dice weights
+    v4_path = "ultimate_ensemble_brain_v4_FINAL.pth"
+    if os.path.exists(v4_path):
+        model.load_state_dict(torch.load(v4_path, map_location=device, weights_only=True))
+        print("✅ Resuming from V4 FINAL (0.7995 Dice) checkpoint for calibration fine-tuning...")
+    else:
+        print("⚠️ V4 FINAL not found. Looking for V3 fallback...")
+        v3_path = "ultimate_ensemble_brain_v3.pth"
+        if os.path.exists(v3_path):
+            model.load_state_dict(torch.load(v3_path, map_location=device, weights_only=True))
+            print("✅ Resuming from V3 checkpoint...")
 
-    # Precision learning rate
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=5e-3)
+    # Ultra-precision learning rate for fine-tuning
+    optimizer = optim.AdamW(model.parameters(), lr=5e-6, weight_decay=5e-3)
     
-    print("🧠 BRAIN V4: Final Precision Stitch for 0.80+ Dice...")
-    for epoch in range(10):
+    print("🧠 BRAIN V4.1: Calibrated Fine-Tuning for strictly >0.80 Dice...")
+    # Reduced to 5 epochs since we are fine-tuning an already highly trained model
+    for epoch in range(5):
         model.train()
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/10")
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/5")
         for img, msk, lbl in loop:
             img, msk, lbl = img.to(device), msk.to(device), lbl.to(device)
             optimizer.zero_grad()
             p_mask, p_clf = model(img)
             
-            # Weighted V4 Loss
-            loss_clf = nn.functional.binary_cross_entropy_with_logits(p_clf, lbl.unsqueeze(1))
-            loss_seg = torch.log(torch.cosh(focal_tversky_loss(p_mask, msk))) if lbl.sum() > 0 else 0
-            (10.0 * loss_seg + loss_clf).backward() # High Seg priority
+            # --- 1. LABEL SMOOTHING (Cures 0.1933 ECE Overconfidence) ---
+            lbl_smoothed = lbl.unsqueeze(1) * 0.9 + 0.05 
+            loss_clf = nn.functional.binary_cross_entropy_with_logits(p_clf, lbl_smoothed)
+            
+            # --- 2. TARGETED LOG-COSH SEGMENTATION (Pushes Dice > 0.80) ---
+            pos_mask_indices = (lbl > 0).nonzero(as_tuple=True)[0]
+            if len(pos_mask_indices) > 0:
+                filtered_p_mask = p_mask[pos_mask_indices]
+                filtered_msk = msk[pos_mask_indices]
+                
+                # Wrap focal tversky in Log-Cosh for severe boundary punishment
+                ft_loss = focal_tversky_loss(filtered_p_mask, filtered_msk)
+                loss_seg = torch.log(torch.cosh(ft_loss))
+                
+                # Heavily weight segmentation to force boundary refinement
+                total_loss = (15.0 * loss_seg) + loss_clf 
+            else:
+                loss_seg = torch.tensor(0.0) 
+                total_loss = loss_clf
+            
+            total_loss.backward() 
             
             # Clip gradients for stability
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            loop.set_postfix(loss=(10.0*loss_seg + loss_clf).item() if isinstance(loss_seg, torch.Tensor) else loss_clf.item())
+            loop.set_postfix(loss=total_loss.item())
 
     torch.save(model.state_dict(), "ultimate_ensemble_brain_v4_FINAL.pth")
-    print("⭐ V4 Final Precision Stitching Complete!")
+    print("⭐ V4.1 Final Calibrated Stitching Complete!")
 
 if __name__ == "__main__": main()
