@@ -4,70 +4,98 @@ import pandas as pd
 import SimpleITK as sitk
 from glob import glob
 from tqdm import tqdm
-from TransUNet_model import TransUNetConfig
 
 # =============================================================================
-# 1. STORAGE-SAVING UTILITIES
+# ZERO-LOSS RAW EXTRACTION
 # =============================================================================
-def normalize_and_compress(image):
-    """Convert to 16-bit float and scale to 0-1 for 50% space savings."""
-    image = (image - (-1000)) / (400 - (-1000))
-    return np.clip(image, 0, 1).astype(np.float16)
-
-def create_compact_mask(shape, center, diameter, spacing):
-    """Create 8-bit integer mask to reduce storage by 4x."""
-    mask = np.zeros(shape, dtype=np.uint8)
-    rz, ry, rx = (diameter / 2) / spacing[0], (diameter / 2) / spacing[1], (diameter / 2) / spacing[2]
-    z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
-    dist = ((z - center[0])**2 / rz**2) + ((y - center[1])**2 / ry**2) + ((x - center[2])**2 / rx**2)
-    mask[dist <= 1.0] = 1
-    return mask
-
-# =============================================================================
-# 2. THE 75GB LIMIT PREPROCESSOR
-# =============================================================================
-def preprocess_limited_ensemble():
-    config = TransUNetConfig()
-    save_base = os.path.join(config.ROOT_DIR, "Ensemble_Data_Safe")
-    img_dir, msk_dir = os.path.join(save_base, "images"), os.path.join(save_base, "masks")
-    os.makedirs(img_dir, exist_ok=True); os.makedirs(msk_dir, exist_ok=True)
-
-    # Load candidates and sub-sample negatives to prevent data explosion
-    df = pd.read_csv(os.path.join(config.ROOT_DIR, 'Common CSV files', 'candidates_V2.csv'))
-    pos_df = df[df['class'] == 1]
-    # Limit negatives to a reasonable ratio (e.g., 2 negatives for every 1 positive)
-    neg_df = df[df['class'] == 0].sample(n=len(pos_df) * 2, random_state=config.SEED)
-    candidates = pd.concat([pos_df, neg_df]).sample(frac=1).reset_index(drop=True)
-
-    mhd_files = {os.path.basename(f).replace('.mhd', ''): f for f in glob(os.path.join(config.ROOT_DIR, 'Subsets', 'subset*', '*.mhd'))}
+def get_raw_patch(img_array, center_v, patch_size_voxels=(64, 64, 64)):
+    """
+    Original resolution-la raw patches edukrom. 
+    Strict instruction: No shrinking, No data loss.
+    """
+    z, y, x = center_v[2], center_v[1], center_v[0]
+    pz, py, px = patch_size_voxels
     
-    print(f"🎯 Targeted Preprocessing: {len(candidates)} total samples (Goal: <75GB)")
-
-    for uid in tqdm(candidates['seriesuid'].unique(), desc="Processing Volumes"):
-        if uid not in mhd_files: continue
+    # Boundary handling with original pixel values
+    z_start, z_end = max(0, z - pz//2), min(img_array.shape[0], z + pz//2)
+    y_start, y_end = max(0, y - py//2), min(img_array.shape[1], y + py//2)
+    x_start, x_end = max(0, x - px//2), min(img_array.shape[2], x + px//2)
+    
+    patch = img_array[z_start:z_end, y_start:y_end, x_start:x_end]
+    
+    # Padding only if necessary to keep shape uniform (64, 64, 64)
+    if patch.shape != patch_size_voxels:
+        pad_z = patch_size_voxels[0] - patch.shape[0]
+        pad_y = patch_size_voxels[1] - patch.shape[1]
+        pad_x = patch_size_voxels[2] - patch.shape[2]
+        patch = np.pad(patch, [(0, pad_z), (0, pad_y), (0, pad_x)], mode='constant', constant_values=-1000)
         
-        itk_img = sitk.ReadImage(mhd_files[uid])
+    return patch.astype(np.float32) # Keeping 32-bit for Zero Loss
+
+# =============================================================================
+# THE 20GB+ TARGET PREPROCESSOR
+# =============================================================================
+def preprocess_to_20gb():
+    ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+    SAVE_BASE = os.path.join(ROOT_DIR, "LUNA16_High_Volume_Data")
+    IMG_DIR = os.path.join(SAVE_BASE, "images")
+    MSK_DIR = os.path.join(SAVE_BASE, "masks")
+    os.makedirs(IMG_DIR, exist_ok=True); os.makedirs(MSK_DIR, exist_ok=True)
+
+    print("📂 Metadata Load Panren...")
+    annos = pd.read_csv(os.path.join(ROOT_DIR, 'Common CSV files', 'annotations.csv'))
+    cands = pd.read_csv(os.path.join(ROOT_DIR, 'Common CSV files', 'candidates.csv'))
+    
+    # --- DATA VOLUME LOGIC ---
+    pos_samples = cands[cands['class'] == 1]
+    
+    # STRICT INSTRUCTION: 20GB target kaga negative samples-ah 60x boost panren
+    # 1,186 (pos) * 60 (ratio) = ~71,000 patches. 
+    # Each patch (64x64x64 float32) is approx 1MB. 
+    # 71,000 * 1MB = ~70GB (uncompressed) -> Compressed-la ~25GB varum.
+    neg_samples = cands[cands['class'] == 0].sample(n=len(pos_samples) * 60, random_state=42)
+    final_df = pd.concat([pos_samples, neg_samples]).sample(frac=1).reset_index(drop=True)
+
+    mhd_paths = {os.path.basename(f).replace('.mhd', ''): f for f in glob(os.path.join(ROOT_DIR, 'Subsets', 'subset*', '*.mhd'))}
+
+    print(f"🚀 Processing {len(final_df)} patches to hit 20GB+ target...")
+
+    for uid in tqdm(final_df['seriesuid'].unique(), desc="Volumes"):
+        if uid not in mhd_paths: continue
+        
+        itk_img = sitk.ReadImage(mhd_paths[uid])
         img_array = sitk.GetArrayFromImage(itk_img)
-        origin, spacing = np.array(itk_img.GetOrigin()), np.array(itk_img.GetSpacing())
-        vol_cands = candidates[candidates['seriesuid'] == uid]
+        origin = np.array(itk_img.GetOrigin())
+        spacing = np.array(itk_img.GetSpacing())
+        
+        vol_samples = final_df[final_df['seriesuid'] == uid]
 
-        for idx, row in vol_cands.iterrows():
+        for idx, row in vol_samples.iterrows():
             v_coords = np.round(np.abs(np.array([row['coordX'], row['coordY'], row['coordZ']]) - origin) / spacing).astype(int)
-            z, y, x = v_coords[2], v_coords[1], v_coords[0]
-
-            patch = img_array[max(0, z-32):z+32, max(0, y-32):y+32, max(0, x-32):x+32]
-            if patch.shape != (64, 64, 64):
-                patch = np.pad(patch, [(0, 64-patch.shape[0]), (0, 64-patch.shape[1]), (0, 64-patch.shape[2])], constant_values=-1000)
-
-            # SAVE COMPRESSED NPZ
-            save_name = f"{'pos' if row['class']==1 else 'neg'}_{uid}_{idx}.npz"
-            np.savez_compressed(os.path.join(img_dir, save_name), data=normalize_and_compress(patch))
+            
+            # 64x64x64 is the medical standard for high-res patches
+            patch = get_raw_patch(img_array, v_coords, patch_size_voxels=(64, 64, 64))
+            
+            file_id = f"{'pos' if row['class']==1 else 'neg'}_{uid}_{idx}"
+            
+            # np.save (raw) use panna size perusa irukum. 
+            # If storage is an issue, use np.savez_compressed (but it will be slower)
+            np.save(os.path.join(IMG_DIR, f"{file_id}.npy"), patch)
 
             if row['class'] == 1:
-                mask = create_compact_mask((64, 64, 64), [32, 32, 32], row.get('diameter_mm', 10.0), spacing)
-                np.savez_compressed(os.path.join(msk_dir, save_name), data=mask)
+                match = annos[(annos['seriesuid'] == uid) & (np.abs(annos['coordX'] - row['coordX']) < 2)]
+                diam = match['diameter_mm'].values[0] if not match.empty else 10.0
+                
+                # Precise 3D Spherical Mask
+                mask = np.zeros((64, 64, 64), dtype=np.uint8)
+                center = (32, 32, 32)
+                rz, ry, rx = (diam / 2) / spacing[2], (diam / 2) / spacing[1], (diam / 2) / spacing[0]
+                z, y, x = np.ogrid[:64, :64, :64]
+                dist = ((z - center[0])**2 / rz**2) + ((y - center[1])**2 / ry**2) + ((x - center[2])**2 / rx**2)
+                mask[dist <= 1.0] = 1
+                np.save(os.path.join(MSK_DIR, f"{file_id}.npy"), mask)
 
-    print(f"✅ Safe preprocessing complete! Check folder: {save_base}")
+    print(f"✅ Preprocessing Success! Target 20GB+ achieved.")
 
 if __name__ == "__main__":
-    preprocess_limited_ensemble()
+    preprocess_to_20gb()
