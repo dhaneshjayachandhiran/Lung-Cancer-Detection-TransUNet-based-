@@ -4,11 +4,8 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import os
-import random
 from glob import glob
 import matplotlib.pyplot as plt
-import SimpleITK as sitk
-from scipy import ndimage
 import io
 
 # Import your architectures
@@ -84,10 +81,11 @@ def load_model(path):
 # HELPER FUNCTIONS 
 # =============================================================================
 def load_ct_scan(path):
-    itk_img = sitk.ReadImage(path)
-    img_array = sitk.GetArrayFromImage(itk_img)
-    origin = np.array(itk_img.GetOrigin())
-    spacing = np.array(itk_img.GetSpacing())
+    # Reads the compressed .npz file instantly
+    data = np.load(path)
+    img_array = data['img']
+    origin = data['origin']
+    spacing = data['spacing']
     return img_array, origin, spacing
 
 def world_to_voxel(world_coords, origin, spacing):
@@ -102,11 +100,14 @@ def scale_confidence(raw_prob):
     return scaled_conf
 
 # =============================================================================
-# PATHS & CONFIGURATION
+# PATHS & CONFIGURATION (FIXED)
 # =============================================================================
+# Base structure exactly matching your folder setup
 BASE_DIR = "LUNA16_High_Volume_Data"
 CSV_PATH = os.path.join("Common CSV files", "candidates_V2.csv") 
-SUBSETS_DIR = "Subsets"
+
+# Directing the UI to look inside LUNA16_High_Volume_Data/Compressed_UI_Scans
+SUBSETS_DIR = os.path.join(BASE_DIR, "Compressed_UI_Scans")
 
 WEIGHTS = {
     "SCRATCH FINAL (Baseline)": "ultimate_ensemble_brain_SCRATCH_FINAL.pth"
@@ -151,14 +152,20 @@ with tab_db:
             world_coords = np.array([candidate['coordX'], candidate['coordY'], candidate['coordZ']])
             gt_label = int(candidate['class'])
 
-            mhd_files = glob(os.path.join(SUBSETS_DIR, "**", f"{seriesuid}.mhd"), recursive=True)
-            if not mhd_files:
-                st.error(f"Could not find raw scan `{seriesuid}.mhd`")
+            # Searching specifically for the .npz file in the exact folder
+            npz_files = glob(os.path.join(SUBSETS_DIR, f"{seriesuid}.npz"))
+            
+            # Fallback recursive search just in case they are in subfolders
+            if not npz_files:
+                npz_files = glob(os.path.join(SUBSETS_DIR, "**", f"{seriesuid}.npz"), recursive=True)
+
+            if not npz_files:
+                st.error(f"Could not find compressed scan `{seriesuid}.npz` inside `{SUBSETS_DIR}`")
                 st.stop()
-            mhd_path = mhd_files[0]
+            npz_path = npz_files[0]
 
         with st.spinner("Extracting 3D Volume & Rendering Multi-Planar Views..."):
-            img_array, origin, spacing = load_ct_scan(mhd_path)
+            img_array, origin, spacing = load_ct_scan(npz_path)
             voxel_coords = world_to_voxel(world_coords, origin, spacing)
             vx, vy, vz = voxel_coords[0], voxel_coords[1], voxel_coords[2]
             
@@ -285,7 +292,7 @@ with tab_db:
 with tab_upload:
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("### 📤 Upload Extracted Nodule Patch (.npy format)")
-    st.info("Note: Full 3D .mhd CT scan processing requires the backend coordinate detection pipeline. For demo purposes, please upload a pre-extracted 64x64x64 or 16x64x64 numpy array (.npy) representing the isolated nodule region.")
+    st.info("Note: Full 3D CT scan processing requires the backend coordinate detection pipeline. For demo purposes, please upload a pre-extracted numpy array (.npy) representing the isolated nodule region.")
     
     uploaded_file = st.file_uploader("Choose a .npy file", type=["npy"])
     
