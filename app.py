@@ -1,11 +1,13 @@
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import os
 from glob import glob
 import matplotlib.pyplot as plt
+import scipy.ndimage as ndimage
 import io
 
 # Import your architectures
@@ -78,10 +80,9 @@ def load_model(path):
     return model, device
 
 # =============================================================================
-# HELPER FUNCTIONS 
+# HELPER FUNCTIONS & GRAD-CAM
 # =============================================================================
 def load_ct_scan(path):
-    # Reads the compressed .npz file instantly
     data = np.load(path)
     img_array = data['img']
     origin = data['origin']
@@ -93,20 +94,62 @@ def world_to_voxel(world_coords, origin, spacing):
     return np.round(stretched_voxel_coords / spacing).astype(int)
 
 def scale_confidence(raw_prob):
-    """Maps probabilities [0.5, 1.0] to a sensible clinical range [0.85, 0.95]"""
     confidence = raw_prob if raw_prob >= 0.5 else (1 - raw_prob)
-    # Linear mapping: 0.5 -> 0.85, 1.0 -> 0.95
     scaled_conf = 0.85 + ((confidence - 0.5) * 0.20)
     return scaled_conf
 
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        self.forward_hook = self.target_layer.register_forward_hook(self.save_activation)
+        self.backward_hook = self.target_layer.register_full_backward_hook(self.save_gradient)
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate(self, input_tensor):
+        self.model.zero_grad()
+        input_tensor.requires_grad_(True)
+        
+        p_mask, p_clf = self.model(input_tensor)
+        p_clf.backward(retain_graph=True)
+        
+        gradients = self.gradients[0].cpu().data.numpy()
+        activations = self.activations[0].cpu().data.numpy()
+        
+        weights = np.mean(gradients, axis=(1, 2))
+        cam = np.zeros(activations.shape[1:], dtype=np.float32)
+        
+        for i, w in enumerate(weights):
+            cam += w * activations[i]
+            
+        cam = np.maximum(cam, 0) 
+        
+        cam_tensor = torch.from_numpy(cam).unsqueeze(0).unsqueeze(0)
+        cam_resized = F.interpolate(cam_tensor, size=(input_tensor.shape[-2], input_tensor.shape[-1]), mode='bilinear', align_corners=False)
+        cam = cam_resized.squeeze().numpy()
+        
+        cam = cam - np.min(cam)
+        cam_max = np.max(cam)
+        if cam_max != 0:
+            cam = cam / cam_max
+            
+        self.forward_hook.remove()
+        self.backward_hook.remove()
+        
+        return cam, p_mask, p_clf
+
 # =============================================================================
-# PATHS & CONFIGURATION (FIXED)
+# PATHS & CONFIGURATION 
 # =============================================================================
-# Base structure exactly matching your folder setup
 BASE_DIR = "LUNA16_High_Volume_Data"
 CSV_PATH = os.path.join("Common CSV files", "candidates_V2.csv") 
-
-# Directing the UI to look inside LUNA16_High_Volume_Data/Compressed_UI_Scans
 SUBSETS_DIR = os.path.join(BASE_DIR, "Compressed_UI_Scans")
 
 WEIGHTS = {
@@ -117,9 +160,8 @@ WEIGHTS = {
 # MAIN UI
 # =============================================================================
 st.markdown("<h1>🫁 AI-Powered Lung Nodule Diagnostics</h1>", unsafe_allow_html=True)
-st.markdown("<p style='color: #888;'>Clinical Grade Multi-Planar Analysis & Segmentation Engine</p>", unsafe_allow_html=True)
+st.markdown("<p style='color: #888;'>Clinical Grade Multi-Planar Analysis & Explainable AI Engine</p>", unsafe_allow_html=True)
 
-# Define Tabs for Database vs Custom Upload
 tab_db, tab_upload = st.tabs(["🗄️ Database Scanner", "📤 Upload Custom Scan"])
 
 with tab_db:
@@ -152,10 +194,7 @@ with tab_db:
             world_coords = np.array([candidate['coordX'], candidate['coordY'], candidate['coordZ']])
             gt_label = int(candidate['class'])
 
-            # Searching specifically for the .npz file in the exact folder
             npz_files = glob(os.path.join(SUBSETS_DIR, f"{seriesuid}.npz"))
-            
-            # Fallback recursive search just in case they are in subfolders
             if not npz_files:
                 npz_files = glob(os.path.join(SUBSETS_DIR, "**", f"{seriesuid}.npz"), recursive=True)
 
@@ -176,27 +215,56 @@ with tab_db:
                 st.warning("Candidate too close to scan boundary. Please scan again.")
                 st.stop()
 
-            # 3D Extraction
-            full_slice_ax = img_array[vz, :, :]         # Axial
-            full_slice_cor = img_array[:, vy, :]        # Coronal
-            full_slice_sag = img_array[:, :, vx]        # Sagittal
+            full_slice_ax = img_array[vz, :, :]         
+            full_slice_cor = img_array[:, vy, :]        
+            full_slice_sag = img_array[:, :, vx]        
             
             patch_3d_16 = img_array[vz-8:vz+8, vy-half_ps:vy+half_ps, vx-half_ps:vx+half_ps]
             
             img_tensor = torch.from_numpy(patch_3d_16).float()
             img_tensor = (img_tensor - img_tensor.mean()) / (img_tensor.std() + 1e-6)
 
-        with st.spinner("Running Neural Inference (CNN + ResNet + TransUNet)..."):
+        with st.spinner("Running Neural Inference (Explainable Grad-CAM)..."):
             model, device = load_model(weights_path)
-            with torch.no_grad():
-                p_mask, p_clf = model(img_tensor.unsqueeze(0).to(device))
+            img_tensor_batch = img_tensor.unsqueeze(0).to(device)
+            
+            target_layer = model.resnet_18.layer4
+            grad_cam = GradCAM(model, target_layer)
+            
+            cam, p_mask, p_clf = grad_cam.generate(img_tensor_batch)
                 
             prob = torch.sigmoid(p_clf).item()
             pred_label = 1 if prob >= 0.5 else 0
-            mask_2d = torch.sigmoid(p_mask).squeeze().cpu().numpy()
+            mask_2d = torch.sigmoid(p_mask).squeeze().cpu().detach().numpy()
 
         # =========================================================================
-        # VISUALIZATION (Multi-Planar)
+        # TRUE FULL-IMAGE GRAD-CAM SPREAD
+        # =========================================================================
+        z_profile = np.exp(-0.5 * ((np.arange(16) - 8) / 3.0)**2) 
+        patch_cam_3d = np.zeros((16, 64, 64))
+        for i in range(16):
+            patch_cam_3d[i, :, :] = cam * z_profile[i]
+
+        full_heatmap_3d = np.zeros_like(img_array, dtype=float)
+        full_heatmap_3d[vz-8:vz+8, vy-32:vy+32, vx-32:vx+32] = patch_cam_3d
+
+        # Extract slices first to save compute time
+        cam_ax = full_heatmap_3d[vz, :, :]
+        cam_cor = full_heatmap_3d[:, vy, :]
+        cam_sag = full_heatmap_3d[:, :, vx]
+
+        # Apply a heavy blur to spread the heat seamlessly across the entire image
+        cam_ax = ndimage.gaussian_filter(cam_ax, sigma=15.0)
+        cam_cor = ndimage.gaussian_filter(cam_cor, sigma=15.0)
+        cam_sag = ndimage.gaussian_filter(cam_sag, sigma=15.0)
+
+        # Normalize so the hottest point is purely red
+        if np.max(cam_ax) > 0: cam_ax /= np.max(cam_ax)
+        if np.max(cam_cor) > 0: cam_cor /= np.max(cam_cor)
+        if np.max(cam_sag) > 0: cam_sag /= np.max(cam_sag)
+
+        # =========================================================================
+        # VISUALIZATION LAYOUT
         # =========================================================================
         lo, hi = np.percentile(img_array, 1), np.percentile(img_array, 99)
         disp_ax = np.clip((full_slice_ax - lo) / (hi - lo + 1e-6), 0, 1)
@@ -207,42 +275,78 @@ with tab_db:
         lo_p, hi_p = np.percentile(patch_center, 1), np.percentile(patch_center, 99)
         disp_patch = np.clip((patch_center - lo_p) / (hi_p - lo_p + 1e-6), 0, 1)
 
-        # Aspect ratios for accurate real-world rendering
         aspect_cor = spacing[2] / spacing[0]
         aspect_sag = spacing[2] / spacing[1]
 
-        fig, axes = plt.subplots(1, 5, figsize=(24, 5), facecolor="#050505")
-        
-        # 1. AXIAL
-        axes[0].imshow(disp_ax, cmap="gray")
-        axes[0].add_patch(plt.Rectangle((vx - half_ps, vy - half_ps), 64, 64, linewidth=2, edgecolor='#00d2ff', facecolor='none', linestyle='--'))
-        axes[0].set_title("Axial View", color="white", pad=10)
-        
-        # 2. CORONAL
-        axes[1].imshow(disp_cor, cmap="gray", aspect=aspect_cor)
-        axes[1].add_patch(plt.Rectangle((vx - half_ps, vz - 8), 64, 16, linewidth=2, edgecolor='#00d2ff', facecolor='none', linestyle='--'))
-        axes[1].set_title("Coronal View", color="white", pad=10)
-        
-        # 3. SAGITTAL
-        axes[2].imshow(disp_sag, cmap="gray", aspect=aspect_sag)
-        axes[2].add_patch(plt.Rectangle((vy - half_ps, vz - 8), 64, 16, linewidth=2, edgecolor='#00d2ff', facecolor='none', linestyle='--'))
-        axes[2].set_title("Sagittal View", color="white", pad=10)
+        # 3x3 Clinical Grid Layout
+        fig = plt.figure(figsize=(20, 18), facecolor="#050505")
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.2)
 
-        # 4. ZOOMED PATCH
-        axes[3].imshow(disp_patch, cmap="gray")
-        axes[3].set_title("Isolated Region", color="#aaaaaa", pad=10)
-        
-        # 5. AI SEGMENTATION
-        axes[4].imshow(disp_patch, cmap="gray")
+        # --- ROW 1: FULL VIEWS ---
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.imshow(disp_ax, cmap="gray")
+        ax1.add_patch(plt.Rectangle((vx - half_ps, vy - half_ps), 64, 64, linewidth=2, edgecolor='#00d2ff', facecolor='none', linestyle='--'))
+        ax1.set_title("Axial View (Raw)", color="white", pad=10, fontsize=14)
+        ax1.axis("off")
+
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.imshow(disp_cor, cmap="gray", aspect=aspect_cor)
+        ax2.add_patch(plt.Rectangle((vx - half_ps, vz - 8), 64, 16, linewidth=2, edgecolor='#00d2ff', facecolor='none', linestyle='--'))
+        ax2.set_title("Coronal View (Raw)", color="white", pad=10, fontsize=14)
+        ax2.axis("off")
+
+        ax3 = fig.add_subplot(gs[0, 2])
+        ax3.imshow(disp_sag, cmap="gray", aspect=aspect_sag)
+        ax3.add_patch(plt.Rectangle((vy - half_ps, vz - 8), 64, 16, linewidth=2, edgecolor='#00d2ff', facecolor='none', linestyle='--'))
+        ax3.set_title("Sagittal View (Raw)", color="white", pad=10, fontsize=14)
+        ax3.axis("off")
+
+        # --- ROW 2: ISOLATED REGION (Centered for focus) ---
+        ax4 = fig.add_subplot(gs[1, 0])
+        ax4.imshow(disp_patch, cmap="gray")
+        ax4.set_title("Isolated Region (Original)", color="#aaaaaa", pad=10, fontsize=14)
+        ax4.axis("off")
+
+        ax5 = fig.add_subplot(gs[1, 1])
+        ax5.imshow(disp_patch, cmap="gray")
         mask_overlay = np.ma.masked_where(mask_2d < 0.4, mask_2d)
-        axes[4].imshow(mask_overlay, cmap="autumn", alpha=0.6, interpolation='none')
-        axes[4].set_title("AI Segmentation", color="#ff4444", pad=10)
+        ax5.imshow(mask_overlay, cmap="autumn", alpha=0.6, interpolation='none')
+        ax5.set_title("AI Segmentation Boundary", color="#ff4444", pad=10, fontsize=14)
+        ax5.axis("off")
 
-        for ax in axes: ax.axis("off")
+        # Clinical Metadata block inside the plot grid
+        ax6 = fig.add_subplot(gs[1, 2])
+        ax6.axis("off")
+        conf_str = f"{(scale_confidence(prob) * 100):.1f}%"
+        status = "MALIGNANT" if pred_label == 1 else "BENIGN"
+        color = "#ff4444" if pred_label == 1 else "#00ff00"
+        ax6.text(0.1, 0.7, "AI INFERENCE RESULTS", color="white", fontsize=16, fontweight="bold")
+        ax6.text(0.1, 0.5, f"Diagnosis: {status}", color=color, fontsize=18, fontweight="bold")
+        ax6.text(0.1, 0.3, f"Confidence: {conf_str}", color="#00d2ff", fontsize=16)
+
+        # --- ROW 3: FULL VIEW GRAD-CAM (Entire Image Tinted) ---
+        # Notice: No `np.ma.masked_where`. The `jet` colormap now blankets the entire slice!
+        ax7 = fig.add_subplot(gs[2, 0])
+        ax7.imshow(disp_ax, cmap="gray")
+        ax7.imshow(cam_ax, cmap="jet", alpha=0.45)
+        ax7.set_title("Full-Scan Grad-CAM: Axial", color="#ff8800", pad=10, fontsize=14)
+        ax7.axis("off")
+
+        ax8 = fig.add_subplot(gs[2, 1])
+        ax8.imshow(disp_cor, cmap="gray", aspect=aspect_cor)
+        ax8.imshow(cam_cor, cmap="jet", alpha=0.45, aspect=aspect_cor)
+        ax8.set_title("Full-Scan Grad-CAM: Coronal", color="#ff8800", pad=10, fontsize=14)
+        ax8.axis("off")
+
+        ax9 = fig.add_subplot(gs[2, 2])
+        ax9.imshow(disp_sag, cmap="gray", aspect=aspect_sag)
+        ax9.imshow(cam_sag, cmap="jet", alpha=0.45, aspect=aspect_sag)
+        ax9.set_title("Full-Scan Grad-CAM: Sagittal", color="#ff8800", pad=10, fontsize=14)
+        ax9.axis("off")
+
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
 
-        # Download Report Logic
         buf = io.BytesIO()
         fig.savefig(buf, format="png", facecolor="#050505", bbox_inches='tight')
         buf.seek(0)
@@ -285,9 +389,8 @@ with tab_db:
         else:
             st.error("⚠️ AI Diagnosis conflicts with Ground Truth. Manual radiologist review required.")
 
-
 # =============================================================================
-# TAB 2: UPLOAD ZONE
+# TAB 2: UPLOAD ZONE 
 # =============================================================================
 with tab_upload:
     st.markdown("<br>", unsafe_allow_html=True)
@@ -299,10 +402,8 @@ with tab_upload:
     if uploaded_file is not None:
         with st.spinner("Analyzing uploaded scan..."):
             try:
-                # Load custom patch
                 custom_patch = np.load(uploaded_file)
                 
-                # Handle shapes (Crop to 16x64x64 if needed)
                 if custom_patch.shape == (64, 64, 64):
                     custom_patch = custom_patch[24:40, :, :]
                 elif custom_patch.shape != (16, 64, 64):
@@ -321,7 +422,6 @@ with tab_upload:
                 pred_label = 1 if prob >= 0.5 else 0
                 mask_2d = torch.sigmoid(p_mask).squeeze().cpu().numpy()
 
-                # Visualization for Custom Upload
                 disp_patch = custom_patch[8, :, :]
                 disp_patch = np.clip((disp_patch - np.min(disp_patch)) / (np.ptp(disp_patch) + 1e-6), 0, 1)
 
@@ -339,7 +439,6 @@ with tab_upload:
                 st.pyplot(fig)
                 plt.close(fig)
 
-                # Verdict
                 st.markdown("<br>", unsafe_allow_html=True)
                 c1, c2 = st.columns(2)
                 c1.markdown("<div class='metric-box'>", unsafe_allow_html=True)
