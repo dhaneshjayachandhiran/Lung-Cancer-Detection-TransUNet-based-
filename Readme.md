@@ -78,7 +78,7 @@ venv\Scripts\activate
 
 2. **Install Required Libraries**:
 ```bash
-pip install torch torchvision numpy pandas matplotlib scipy streamlit tqdm
+pip install -r requirements.txt
 ```
 *(Note: `scipy` is strictly required for the 3D Volumetric Grad-CAM Gaussian projections).*
 
