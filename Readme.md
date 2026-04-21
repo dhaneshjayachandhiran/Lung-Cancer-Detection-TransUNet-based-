@@ -86,7 +86,7 @@ pip install -r requirements.txt
 * Download the LUNA16 CT Scan Dataset.
 * Ensure original `.mhd` files have been routed through the compression script to generate `.npz` files inside the `Compressed_UI_Scans/` directory.
 
-4. **Launching the Diagnostic UI**:
+4. **Launching UI Interface**:
 ```bash
 streamlit run app.py
 ```
