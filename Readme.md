@@ -23,7 +23,7 @@ This research project focuses on the automated detection, segmentation, and expl
 * **Feature**: Employs a **6-layer Vision Transformer Bottleneck** to capture global context and long-range dependencies.
 * **Innovation**: Uses **Hybrid Loss** (Dice Loss + Focal Loss) to handle severe class imbalance (Malignant vs. Benign).
 
-### 4. 🧠 The Ultimate Ensemble Brain (Final Proposed Model)
+### 4. 🧠 The Ensemble Model - Tri Fusion Ensemble Model (Final Proposed Model)
 * **Architecture**: A multi-modal fusion engine.
 * **Mechanism**: Simultaneously passes the 3D voxel patch through the SimpleCNN, ResNet-18, and TransUNet. The outputs are flattened, concatenated, and fed into a **Dense Fusion Gate**.
 * **Clinical Advantage**: Eliminates individual model biases by forcing a consensus among textural, spatial, and global attention features, drastically reducing False Positives.
@@ -32,7 +32,7 @@ This research project focuses on the automated detection, segmentation, and expl
 
 ## 📊 Comparative Performance Leaderboard
 
-| Metric | SimpleCNN | ResNet-18 | Ultimate TransUNet | **Ensemble Brain** |
+| Metric | SimpleCNN | ResNet-18 | Ultimate TransUNet | **TSFE** |
 | :--- | :---: | :---: | :---: | :---: |
 | **Mean Dice Score** | 0.8665 | 0.9401 | 0.9191 | **0.95+** |
 | **AUC (Detection)** | 0.9816 | 0.9712 | 0.9807 | **0.99+** |
