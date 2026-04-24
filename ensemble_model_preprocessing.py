@@ -10,7 +10,7 @@ from tqdm import tqdm
 # =============================================================================
 def get_raw_patch(img_array, center_v, patch_size_voxels=(64, 64, 64)):
     """
-    Original resolution-la raw patches edukrom. 
+    Original resolution raw patches. 
     Strict instruction: No shrinking, No data loss.
     """
     z, y, x = center_v[2], center_v[1], center_v[0]
@@ -35,14 +35,14 @@ def get_raw_patch(img_array, center_v, patch_size_voxels=(64, 64, 64)):
 # =============================================================================
 # THE 20GB+ TARGET PREPROCESSOR
 # =============================================================================
-def preprocess_to_20gb():
+def preprocess():
     ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
     SAVE_BASE = os.path.join(ROOT_DIR, "LUNA16_High_Volume_Data")
     IMG_DIR = os.path.join(SAVE_BASE, "images")
     MSK_DIR = os.path.join(SAVE_BASE, "masks")
     os.makedirs(IMG_DIR, exist_ok=True); os.makedirs(MSK_DIR, exist_ok=True)
 
-    print("📂 Metadata Load Panren...")
+    print("📂 Metadata Loading")
     annos = pd.read_csv(os.path.join(ROOT_DIR, 'Common CSV files', 'annotations.csv'))
     cands = pd.read_csv(os.path.join(ROOT_DIR, 'Common CSV files', 'candidates.csv'))
     
@@ -58,7 +58,7 @@ def preprocess_to_20gb():
 
     mhd_paths = {os.path.basename(f).replace('.mhd', ''): f for f in glob(os.path.join(ROOT_DIR, 'Subsets', 'subset*', '*.mhd'))}
 
-    print(f"🚀 Processing {len(final_df)} patches to hit 20GB+ target...")
+    print(f"🚀 Processing {len(final_df)} patches")
 
     for uid in tqdm(final_df['seriesuid'].unique(), desc="Volumes"):
         if uid not in mhd_paths: continue
@@ -98,4 +98,4 @@ def preprocess_to_20gb():
     print(f"✅ Preprocessing Success! Target 20GB+ achieved.")
 
 if __name__ == "__main__":
-    preprocess_to_20gb()
+    preprocess()
