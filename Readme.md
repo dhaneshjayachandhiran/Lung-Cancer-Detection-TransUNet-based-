@@ -91,3 +91,5 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 *Navigate to `http://localhost:8501` to access the clinical dashboard.*
+
+## Authors - Dhanesh J, Akash Krishnan
